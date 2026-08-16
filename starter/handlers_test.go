@@ -281,3 +281,23 @@ func TestPostEvents_CaseSensitiveType(t *testing.T) {
 		t.Errorf("OPENED should be rejected: rejected=%d", resp.Rejected)
 	}
 }
+
+func TestPostEvents_ConflictingDuplicate(t *testing.T) {
+	resetStore()
+	mux := setupMux()
+
+	body1 := `[{"event_id":"evt_conflict_1","campaign_id":"cmp_1","contact_id":"ct_1","type":"opened","timestamp":"2026-08-10T06:00:00Z"}]`
+	body2 := `[{"event_id":"evt_conflict_1","campaign_id":"cmp_1","contact_id":"ct_1","type":"clicked","timestamp":"2026-08-10T06:00:00Z"}]`
+
+	postEvents(t, mux, body1)
+	w := postEvents(t, mux, body2)
+
+	var resp BatchResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Rejected != 1 {
+		t.Errorf("expected 1 rejected event, got %d", resp.Rejected)
+	}
+	if len(resp.Errors) != 1 || !strings.Contains(resp.Errors[0].Reason, "conflicting duplicate") {
+		t.Errorf("expected error reason to contain 'conflicting duplicate', got %+v", resp.Errors)
+	}
+}

@@ -24,7 +24,7 @@ The tricky part isn't the happy path — it's handling all the messy real-world 
 
 - **`unique_opens` is scoped per campaign.** If contact ct_001 opens campaign A and campaign B, that's one unique opener per campaign. The same contact opening the same campaign 5 times is 5 open events but 1 unique opener.
 
-- **Metadata is optional and stored but not validated.** The assignment says metadata is optional. I accept whatever the provider sends in that field.
+- **Metadata is optional and stored but not validated.** I treated metadata as an optional object with string values (`map[string]string`) because the assignment doesn't define a more detailed metadata schema. I accept and store whatever the provider sends in that field.
 
 ## Ambiguities
 
@@ -69,60 +69,59 @@ I intentionally skipped the optional `GET /campaigns/{id}/events` endpoint. It w
 
 **What breaks first?**
 
-The in-memory store. At 100 million events/day (~1,150 events/second sustained, but probably bursty), the map holding every event by `event_id` grows without bound. At maybe 200 bytes per event, you're looking at 20 GB/day of data just sitting in memory. You'd run out of RAM in a day or two.
+The current in-memory store. At 100 million events/day (~1,150 events/second sustained, but highly bursty), keeping the complete event set in one process clearly doesn't scale. Even a rough 200 bytes per event would be about 20 GB/day before accounting for Go map, string, and runtime overhead. 
 
-Also, the single `sync.RWMutex` becomes the bottleneck. Every write takes an exclusive lock on the entire store. At 1,000+ writes/second, goroutines start piling up waiting for the lock.
+Also, memory is volatile. On restart, all historical campaign states are lost. The major immediate problems at this scale are unbounded memory growth, single-process limits, lack of durability, and the potential for expensive statistics scans.
+
+As concurrency increases, lock contention on the single `sync.RWMutex` is something we would measure under load, but it is not automatically the first bottleneck. Moving to a database with row-level locks or sharding state by campaign would mitigate lock contention.
 
 **What I'd change first:**
 
-1. **Move to a real database.** PostgreSQL or a key-value store like DynamoDB. The event store needs to be durable and not limited by RAM. I'd keep the dedup check in the database (unique constraint on `event_id`), which is one less thing to get wrong in application code.
+1. **Move to a durable database.** A relational store like PostgreSQL or a key-value store like DynamoDB/Cassandra. This provides durability and eliminates the RAM bottleneck. I'd delegate the deduplication check to the database using a unique constraint on `event_id`.
 
-2. **Pre-aggregate counters.** Instead of counting events every time someone asks for stats, maintain running counters that get updated on insert. This is what the current code already does, but it'd need to be done atomically in the database (something like `INSERT ... ON CONFLICT DO UPDATE SET sent = sent + 1`).
-
-3. **Shard or partition the lock.** If I kept the in-memory approach temporarily, I'd shard by campaign_id so different campaigns don't block each other. But honestly, moving to a database is the right call at this scale.
+2. **Pre-aggregate counters as derived projections.** Instead of scanning raw events to count stats on demand, we update pre-aggregated tables or counters atomically upon event insertion (e.g., using `INSERT ... ON CONFLICT DO UPDATE SET sent = sent + 1`). This decouples query speed from event volume.
 
 **Would the API contract change?**
 
-Probably not for the read side — `GET /campaigns/{id}/stats` stays the same. For the write side, I might add rate limiting headers or enforce a max batch size. The response shape stays the same.
+The read side (`GET /campaigns/{campaign_id}/stats`) would remain identical. For the write side, we would enforce a maximum batch size per request and add standard rate-limiting headers to protect the service from overloading.
 
 **Would I introduce a queue?**
 
-Yes. At 100M events/day, I'd put a message queue (SQS, or Kafka if we need ordering guarantees) between the HTTP endpoint and the processing logic. The API handler just validates the event format and drops it onto the queue, then returns immediately. Workers consume from the queue and write to the database.
+Yes. A durable queue (like SQS, RabbitMQ, or Kafka) would absorb traffic spikes, decouple ingestion from database writes, and allow workers to process batches asynchronously. 
+
+Kafka would become interesting if replayability, partitioning by campaign/contact, high throughput, or stream processing justified its operational complexity. However, we must configure Kafka partitioning keys carefully if we need strict ordering, and note that the current system does not require events to arrive in order to calculate basic campaign statistics.
 
 **What new problems does that create?**
 
-- **At-least-once delivery.** The queue might redeliver a message, so the workers still need dedup. The database unique constraint handles this.
-- **Eventual consistency.** There's a lag between receiving an event and it showing up in stats. The dashboard might be a few seconds behind. This is probably fine for marketing stats but you'd want to tell the PM about it.
-- **Ordering.** Events can get processed out of order even more than before. But since we already don't depend on ordering, this isn't a new problem — it's just more pronounced.
-- **Dead letter handling.** What do you do with events that fail processing repeatedly? You need a dead letter queue and alerting.
+- **At-least-once delivery**: Message queues can redeliver messages. Workers must be idempotent, which we handle via the database unique constraint.
+- **Eventual consistency**: Ingestion is decoupled from query logic, meaning stats on the dashboard might lag by a few seconds.
+- **Dead letter handling**: Malformed or unprocessable events must be directed to a dead-letter queue (DLQ) for alerting and manual intervention.
 
 **Where can duplicates sneak in at scale?**
 
-- A provider sends an event, the queue accepts it, but the HTTP response times out. The provider retries. Now the event is on the queue twice. Dedup in the database catches this.
-- If we have multiple API servers behind a load balancer, two copies of the same event could land on different servers and both get queued. Again, database-level dedup handles it.
-- If the database insert succeeds but the queue acknowledgment fails, the worker retries. The database unique constraint saves you.
+- **Provider retries**: If a provider times out waiting for our HTTP response, it will retry, queuing the duplicate event.
+- **Load balancer distribution**: Multiple API instances could receive the same retry requests and queue them.
+- **Worker retries**: If a worker writes to the database successfully but fails to acknowledge the queue message, the queue will redeliver it.
 
 **How to keep counters trustworthy?**
 
-- Use database transactions for insert + counter update.
-- Periodically run a reconciliation job that counts the actual events and compares against the aggregated counters. If they drift, you know something's wrong.
-- In the short term, rely on the database's consistency. In the longer term, consider event sourcing where the events are the source of truth and the counters are derived.
+- Use database transactions or upsert logic to pair event insertion with counter increments.
+- Periodically run a background reconciliation job that reconstructs counters directly from the raw event log and patches any drifted counters.
 
 **What would I monitor?**
 
-- Event ingestion rate (events/second) — to know when capacity is getting tight.
-- Queue depth — if it's growing faster than workers drain it, you need more workers.
-- Dedup hit rate — if suddenly 50% of events are duplicates, the provider might have a bug.
-- API latency (p50, p95, p99) — to catch lock contention or database slowness.
-- Error rates on the processing side — to catch schema changes or bad data.
-- Memory and disk usage on the database.
+- Ingestion API request rate and latency (p50, p99).
+- Queue depth and processing lag.
+- Database write latency and CPU utilization.
+- Deduplication match rates (alerting if retry volume spikes).
+- Dead-letter queue count.
 
 **What would I deliberately NOT solve yet?**
 
-- Multi-region replication. Not until the business actually needs it.
-- Real-time streaming stats (WebSockets). Polling every 5-10 seconds is fine for a marketing dashboard.
-- Historical event queries with complex filters. The `GET /campaigns/{id}/events` endpoint can wait until someone actually needs it.
-- Auto-scaling. Get the basics working on a reasonably sized instance first.
+- Multi-region active-active database replication.
+- Real-time event streaming pipelines (e.g., WebSockets for real-time dashboard updates).
+- Complex custom query filtering on historical events.
+
 
 ---
 
@@ -135,42 +134,25 @@ Delivered went up. Opened went down. The marketer says "your dashboard is broken
 
 ### Plausible explanations (before assuming a bug):
 
-1. **Late-arriving delivered events.** Some providers report deliveries with a delay. Between 10:00 and 10:30, 5,000 more delivery confirmations trickled in. Delivered going *up* is completely normal and expected — providers are slow.
+First, we must make a key distinction: **in the current service implementation, ingested events only increment counters, and there is no code path or API endpoint that decrements them**. Therefore, a decrease from 250,000 to 248,000 opens cannot be explained merely by events arriving late. Late-arriving events explain a number increasing over time, not decreasing.
 
-2. **Dedup catch-up on opens.** If a batch of duplicate `opened` events was ingested before 10:00 (maybe our dedup had a bug that was then fixed, or a reprocessing job cleaned up duplicates), the count could drop. For example, if we discovered and removed 2,000 duplicate opens from the store.
-
-3. **A data correction or backfill ran.** If someone ran a script to fix inflated open counts (removing duplicates that were incorrectly counted), opens would drop while other numbers stayed the same or grew.
-
-4. **Two different sources of truth.** If the dashboard at 10:00 was reading from a cache and at 10:30 from the live database (or vice versa), and they were slightly out of sync, you'd see inconsistencies. Cache invalidation is a classic culprit.
-
-5. **Provider sent corrections.** Some providers send "un-open" or correction events. If the system processes those as negating previous opens, the count goes down. (This is unusual but not impossible.)
-
-6. **A recount or recomputation happened.** If the system switched from pre-aggregated counters to computing stats from raw events between 10:00 and 10:30, and the pre-aggregated counters had been wrong, you'd see a jump or drop.
-
-7. **Bot/spam filter reclassification.** Some systems reclassify opens detected as bot activity. If 2,000 opens were reclassified as bot opens and excluded from the count, the number drops.
+To explain the decrease in the open count, we must look at system-level factors:
+1. **Cache Inconsistency**: The dashboard query at 10:00 might have hit an outdated cache or a node with corrupted data that was subsequently invalidated, or the 10:30 query hit a node experiencing cache invalidation issues.
+2. **Read Replica Lag**: The query at 10:30 might have been routed to a read-replica that was experiencing replication lag or network partition issues, displaying a stale/lower event count compared to the primary database.
+3. **Database Write Rollbacks**: A batch transaction failure or a database recovery event might have reverted some event insertions between 10:00 and 10:30.
+4. **Data Cleanup/Correction Scripts**: A backend script or bot-filtering job might have run between 10:00 and 10:30, removing duplicate/spam opens or filtering out automated crawler traffic.
+5. **Code or Deployment Changes**: A new version of the dashboard query or backend service might have been deployed in that 30-minute window, changing how opens or unique opens are defined or filtered.
 
 ### What I'd check first:
 
-1. **Look at the raw event count in the database.** Has the number of `opened` events actually decreased, or is it a display/aggregation issue? If the raw count is still 250,000 events, the bug is in the aggregation or display layer, not the data.
-
-2. **Check for recent deploys or migrations.** Did anything change between 10:00 and 10:30? A code deploy, a database migration, a backfill job?
-
-3. **Check the dedup logic.** Were duplicate events previously being double-counted and now they're not? That would explain the drop.
-
-4. **Check timestamps on the events that make up the difference.** Can I find the ~2,000 opens that "disappeared"?
-
-### How I'd distinguish a bug from expected behavior:
-
-- If the raw event count didn't change but the stat did → aggregation bug.
-- If the raw event count dropped → something deleted events, which is either a cleanup job or a bug.
-- If the opened count *never* decreases in the code path → it's not a code bug, it's a data issue.
-- If I can point to specific events that were correctly deduplicated → it's expected.
+1. **Query the Raw Database directly**: Count the raw event records for the campaign in the primary store. If the database still shows 250,000 opens, then the data is intact, and the issue lies in the aggregation cache, dashboard query, or replica sync.
+2. **Check deployment and maintenance logs**: See if any deployments, manual database queries, or correction scripts were executed around 10:00–10:30.
+3. **Check replica lag and cache status**: Monitor read-replica sync status and cache eviction metrics to see if any nodes fell behind.
 
 ### Is the delivered number rising actually suspicious?
 
-No. Delivered going up is the *most normal thing here*. Providers report deliveries asynchronously. It's completely expected for delivery confirmations to keep trickling in after the send is done. The send is done at 1,000,000 and hasn't changed — that makes sense too, the campaign finished sending. Deliveries catching up is just how the real world works.
+No. The delivered count rising from 970,000 to 975,000 is **completely expected and normal**. Delivery providers retry and report events asynchronously. The campaign finished sending (which is why Sent remains at 1,000,000), but delivery confirmations naturally trickle in over the next several minutes or hours as messages hit recipient servers. This is standard behavior.
 
-The suspicious part is opens going *down*. That's the one that needs investigation.
 
 ---
 
