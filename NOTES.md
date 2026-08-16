@@ -73,7 +73,7 @@ The current in-memory store. At 100 million events/day (~1,150 events/second sus
 
 Also, memory is volatile. On restart, all historical campaign states are lost. The major immediate problems at this scale are unbounded memory growth, single-process limits, lack of durability, and the potential for expensive statistics scans.
 
-As concurrency increases, lock contention on the single `sync.RWMutex` is something we would measure under load, but it is not automatically the first bottleneck. Moving to a database with row-level locks or sharding state by campaign would mitigate lock contention.
+The single "sync.RWMutex" is another thing I'd measure for contention as concurrency grows. If lock contention becomes significant, I could shard the in-memory state by campaign, although at this scale the bigger problems are durability and unbounded memory growth.
 
 **What I'd change first:**
 
@@ -87,9 +87,7 @@ The read side (`GET /campaigns/{campaign_id}/stats`) would remain identical. For
 
 **Would I introduce a queue?**
 
-Yes. A durable queue (like SQS, RabbitMQ, or Kafka) would absorb traffic spikes, decouple ingestion from database writes, and allow workers to process batches asynchronously. 
-
-Kafka would become interesting if replayability, partitioning by campaign/contact, high throughput, or stream processing justified its operational complexity. However, we must configure Kafka partitioning keys carefully if we need strict ordering, and note that the current system does not require events to arrive in order to calculate basic campaign statistics.
+Yes. I'd probably start with a durable queue such as SQS to absorb traffic spikes and separate ingestion from database writes. Kafka becomes more attractive if throughput, replay, partitioning, or stream-processing requirements justify the added complexity. Note that the current system does not require events to arrive in order to calculate campaign statistics, and Kafka ordering depends on how partitions and consumers are configured.
 
 **What new problems does that create?**
 
@@ -134,24 +132,23 @@ Delivered went up. Opened went down. The marketer says "your dashboard is broken
 
 ### Plausible explanations (before assuming a bug):
 
-First, we must make a key distinction: **in the current service implementation, ingested events only increment counters, and there is no code path or API endpoint that decrements them**. Therefore, a decrease from 250,000 to 248,000 opens cannot be explained merely by events arriving late. Late-arriving events explain a number increasing over time, not decreasing.
+First, we must make a key distinction: **in the current implementation, accepted "opened" events increase the opened count, and there is no code path that decrements the opened counter**. Therefore, the drop from 250,000 to 248,000 opens cannot simply be explained by late-arriving events. Late-arriving events explain a number increasing over time (e.g. 250,000 → 252,000), not decreasing.
 
-To explain the decrease in the open count, we must look at system-level factors:
-1. **Cache Inconsistency**: The dashboard query at 10:00 might have hit an outdated cache or a node with corrupted data that was subsequently invalidated, or the 10:30 query hit a node experiencing cache invalidation issues.
-2. **Read Replica Lag**: The query at 10:30 might have been routed to a read-replica that was experiencing replication lag or network partition issues, displaying a stale/lower event count compared to the primary database.
-3. **Database Write Rollbacks**: A batch transaction failure or a database recovery event might have reverted some event insertions between 10:00 and 10:30.
-4. **Data Cleanup/Correction Scripts**: A backend script or bot-filtering job might have run between 10:00 and 10:30, removing duplicate/spam opens or filtering out automated crawler traffic.
-5. **Code or Deployment Changes**: A new version of the dashboard query or backend service might have been deployed in that 30-minute window, changing how opens or unique opens are defined or filtered.
+Instead, a decrease should make us investigate outside the simple counter-increment path. Plausible explanations include:
+1. **Another aggregation source / different query**: The dashboard might have switched its query logic or query filters between 10:00 and 10:30, or pulled from a different metric definition source.
+2. **Dashboard/cache inconsistency**: A caching layer or CDN might have experienced cache invalidation issues, causing the dashboard to read stale data at 10:30 or read corrupted cache entries.
+3. **Querying different replica nodes**: The query at 10:30 might have been routed to a read-replica node suffering from replication lag or data partition issues, compared to the 10:00 query which hit a synchronized node.
+4. **Data pipeline/configuration changes**: A deployment or configuration update might have altered the data pipeline routing or aggregation logic.
+5. **Separate data-correction/reconciliation process**: An independent backend reconciliation job or data-cleanup script (such as a spam/bot-filtering process) might have run to remove duplicate or invalid open events, reducing the count.
+
+Additionally, the delivered count rising from 970,000 to 975,000 is **NOT inherently suspicious**. Delivery confirmations naturally arrive late and out of order from providers, so deliveries continuing to trickle in while Sent remains constant at 1,000,000 is expected production behavior.
 
 ### What I'd check first:
 
-1. **Query the Raw Database directly**: Count the raw event records for the campaign in the primary store. If the database still shows 250,000 opens, then the data is intact, and the issue lies in the aggregation cache, dashboard query, or replica sync.
-2. **Check deployment and maintenance logs**: See if any deployments, manual database queries, or correction scripts were executed around 10:00–10:30.
-3. **Check replica lag and cache status**: Monitor read-replica sync status and cache eviction metrics to see if any nodes fell behind.
+1. **Verify raw database counts directly**: Run a direct SQL/key count query on the primary event store to see if the actual open event count is 250,000 or 248,000. If the primary database contains 250,000, the data is intact and the drop is caused by the caching, routing, or dashboard visualization layer.
+2. **Review deployment and pipeline logs**: Check for any system deployments, database migrations, configuration rollouts, or background reconciliation jobs that executed between 10:00 and 10:30.
+3. **Check replica lag metrics**: Check if any read-replicas fell behind the primary database node during that period.
 
-### Is the delivered number rising actually suspicious?
-
-No. The delivered count rising from 970,000 to 975,000 is **completely expected and normal**. Delivery providers retry and report events asynchronously. The campaign finished sending (which is why Sent remains at 1,000,000), but delivery confirmations naturally trickle in over the next several minutes or hours as messages hit recipient servers. This is standard behavior.
 
 
 ---

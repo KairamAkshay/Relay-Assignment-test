@@ -286,18 +286,45 @@ func TestPostEvents_ConflictingDuplicate(t *testing.T) {
 	resetStore()
 	mux := setupMux()
 
-	body1 := `[{"event_id":"evt_conflict_1","campaign_id":"cmp_1","contact_id":"ct_1","type":"opened","timestamp":"2026-08-10T06:00:00Z"}]`
-	body2 := `[{"event_id":"evt_conflict_1","campaign_id":"cmp_1","contact_id":"ct_1","type":"clicked","timestamp":"2026-08-10T06:00:00Z"}]`
+	body1 := `[{"event_id":"evt_conflict_test","campaign_id":"cmp_test","contact_id":"ct_test","type":"opened","timestamp":"2026-08-10T09:15:04Z"}]`
+	body2 := `[{"event_id":"evt_conflict_test","campaign_id":"cmp_test","contact_id":"ct_test","type":"clicked","timestamp":"2026-08-10T09:15:04Z"}]`
 
-	postEvents(t, mux, body1)
-	w := postEvents(t, mux, body2)
-
-	var resp BatchResponse
-	json.NewDecoder(w.Body).Decode(&resp)
-	if resp.Rejected != 1 {
-		t.Errorf("expected 1 rejected event, got %d", resp.Rejected)
+	// First request - should be accepted.
+	w1 := postEvents(t, mux, body1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first request status: want 200, got %d", w1.Code)
 	}
-	if len(resp.Errors) != 1 || !strings.Contains(resp.Errors[0].Reason, "conflicting duplicate") {
-		t.Errorf("expected error reason to contain 'conflicting duplicate', got %+v", resp.Errors)
+	var resp1 BatchResponse
+	json.NewDecoder(w1.Body).Decode(&resp1)
+	if resp1.Accepted != 1 {
+		t.Errorf("first request accepted: want 1, got %d", resp1.Accepted)
+	}
+
+	// Second request - conflicting event type - should be rejected.
+	w2 := postEvents(t, mux, body2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second request status: want 200, got %d", w2.Code)
+	}
+	var resp2 BatchResponse
+	json.NewDecoder(w2.Body).Decode(&resp2)
+	if resp2.Rejected != 1 {
+		t.Errorf("second request rejected: want 1, got %d", resp2.Rejected)
+	}
+	if len(resp2.Errors) != 1 || !strings.Contains(resp2.Errors[0].Reason, "conflicting duplicate") {
+		t.Errorf("expected error reason to contain 'conflicting duplicate', got %+v", resp2.Errors)
+	}
+
+	// Verify original event was NOT overwritten by checking campaign stats.
+	w3 := getStats(t, mux, "cmp_test")
+	if w3.Code != http.StatusOK {
+		t.Fatalf("stats request status: want 200, got %d", w3.Code)
+	}
+	var stats CampaignStats
+	json.NewDecoder(w3.Body).Decode(&stats)
+	if stats.Opened != 1 {
+		t.Errorf("stats opened count: want 1, got %d (might have been overwritten)", stats.Opened)
+	}
+	if stats.Clicked != 0 {
+		t.Errorf("stats clicked count: want 0, got %d (might have been overwritten)", stats.Clicked)
 	}
 }
